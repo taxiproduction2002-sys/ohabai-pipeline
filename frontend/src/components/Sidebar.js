@@ -1,3 +1,5 @@
+import StatusBadge from './StatusBadge';
+
 export default function Sidebar({
   conversations,
   selectedConvId,
@@ -7,8 +9,11 @@ export default function Sidebar({
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <span>Inbox</span>
-        <span className="counter">{conversations.length}</span>
+        <div className="sidebar-header-left">
+          <span>Inbox</span>
+          <span className="counter">{conversations.length}</span>
+        </div>
+        <StatusBadge />
       </div>
       {error && <div className="error">⚠ {error}</div>}
       <div className="conv-list">

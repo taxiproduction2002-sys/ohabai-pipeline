@@ -31,3 +31,4 @@ export const sendMessage = (id, text) =>
     method: 'POST',
     body: JSON.stringify({ text }),
   });
+export const fetchConnectorStatus = () => api('/api/connector-status');
