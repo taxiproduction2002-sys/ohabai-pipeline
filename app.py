@@ -1,11 +1,12 @@
-"""Ohabai Pipeline Phase 1 API. Connector-agnostic; connectors plug in via /api/connectors/* and /api/outbound-queue/*."""
+"""Ohabai Pipeline backend. Connector-agnostic; connectors plug in via /api/connectors/* and /api/outbound-queue/*."""
 import os
 from dotenv import load_dotenv
 load_dotenv()
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-from sqlalchemy import desc
+from sqlalchemy import desc, text
 from models import (db, Company, User, ChannelAccount, Contact, Conversation,
                     ConversationParticipant, Message, MessageAttachment,
                     MessageDeliveryStatus, AIMemoryBlock, AIReplySuggestion,
@@ -13,6 +14,7 @@ from models import (db, Company, User, ChannelAccount, Contact, Conversation,
 
 app = Flask(__name__)
 CORS(app, resources={r'/api/*': {'origins': '*'}})
+
 db_url = os.environ.get("DATABASE_URL", "postgresql://localhost/ohabai_pipeline")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
@@ -20,15 +22,85 @@ app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 db.init_app(app)
+
+
+def run_migrations():
+    """Idempotent column additions for legacy tables. Postgres-only."""
+    with db.engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE channel_accounts "
+            "ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP"
+        ))
+        conn.execute(text(
+            "ALTER TABLE channel_accounts "
+            "ADD COLUMN IF NOT EXISTS last_error TEXT"
+        ))
+
+
 with app.app_context():
     db.create_all()
+    try:
+        run_migrations()
+    except Exception as e:
+        app.logger.warning("run_migrations skipped: %s", e)
 
 
+# ---------- helpers ----------
 def get_company_id(): return request.headers.get("X-Company-ID")
 def serialize_dt(dt): return dt.isoformat() if dt else None
 def err(msg, status=400): return jsonify({"error": msg}), status
 
 
+# ---------- connector secret enforcement ----------
+# Fail-open if CONNECTOR_SECRET env is not set on the backend (dev mode).
+# Fail-closed (401) once env var is present.
+def require_connector_secret(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        expected = os.environ.get("CONNECTOR_SECRET")
+        if expected:
+            sent = request.headers.get("X-Connector-Secret")
+            if not sent or sent != expected:
+                app.logger.warning(
+                    "rejected connector request: missing/invalid X-Connector-Secret on %s",
+                    request.path,
+                )
+                return jsonify({"error": "invalid connector secret"}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# ---------- queue cleanup ----------
+STUCK_PROCESSING_MINUTES = 5
+
+def cleanup_stuck_queue_items():
+    """Items locked >5min are reset to queued (or failed if at max attempts)."""
+    cutoff = datetime.utcnow() - timedelta(minutes=STUCK_PROCESSING_MINUTES)
+    stuck = OutboundMessageQueue.query.filter(
+        OutboundMessageQueue.status == "processing",
+        OutboundMessageQueue.locked_at < cutoff,
+    ).all()
+    reset, failed = 0, 0
+    for it in stuck:
+        if (it.attempts or 0) >= (it.max_attempts or 3):
+            it.status = "failed"
+            it.error_message = (it.error_message or "") + " [stuck-cleanup-timeout]"
+            failed += 1
+        else:
+            it.status = "queued"
+            it.locked_at = None
+            it.locked_by = None
+            reset += 1
+        app.logger.warning(
+            "stuck queue item %s (attempts=%s) -> %s",
+            it.id, it.attempts, it.status,
+        )
+    if stuck:
+        db.session.commit()
+    return {"reset": reset, "failed": failed, "scanned": len(stuck)}
+
+
+# ---------- conversation routes ----------
 @app.route("/api/conversations", methods=["GET"])
 def list_conversations():
     cid = get_company_id()
@@ -99,19 +171,18 @@ def get_messages(conv_id):
 
 @app.route("/api/conversations/<conv_id>/send", methods=["POST"])
 def send_message(conv_id):
-    """Enqueue outbound. A connector polls /api/outbound-queue/poll to claim and send."""
     cid = get_company_id()
     conv = Conversation.query.filter_by(id=conv_id, company_id=cid).first()
     if not conv:
         return err("conversation not found", 404)
     b = request.get_json(silent=True) or {}
-    text = b.get("text")
+    text_in = b.get("text")
     atts = b.get("attachments") or []
-    if not text and not atts:
+    if not text_in and not atts:
         return err("text or attachments required")
     item = OutboundMessageQueue(
         conversation_id=conv.id, channel_account_id=conv.channel_account_id,
-        payload={"text": text, "attachments": atts,
+        payload={"text": text_in, "attachments": atts,
                  "quoted_external_id": b.get("quoted_external_id"),
                  "message_type": b.get("message_type", "text")},
         status="queued", created_by_user_id=b.get("user_id"))
@@ -120,6 +191,7 @@ def send_message(conv_id):
                     "created_at": serialize_dt(item.created_at)}), 202
 
 
+# ---------- contacts ----------
 @app.route("/api/contacts", methods=["POST"])
 def create_contact():
     cid = get_company_id()
@@ -150,9 +222,9 @@ def update_contact(contact_id):
     return jsonify({"id": c.id})
 
 
+# ---------- channel accounts ----------
 @app.route("/api/channel-accounts", methods=["POST"])
 def create_channel_account():
-    """Phase 2+ connector_type values: whatsapp_cloud_api, instagram_graph, messenger_graph, custom_bridge."""
     cid = get_company_id()
     if not cid:
         return err("X-Company-ID required")
@@ -170,24 +242,74 @@ def create_channel_account():
     return jsonify({"id": ch.id}), 201
 
 
+# ---------- connector status (frontend-facing) ----------
+STALE_HEARTBEAT_SECONDS = 60
+
+@app.route("/api/connector-status", methods=["GET"])
+def connector_status():
+    cid = get_company_id()
+    if not cid:
+        return err("X-Company-ID required")
+    chs = ChannelAccount.query.filter_by(company_id=cid).all()
+    now = datetime.utcnow()
+    out = []
+    for ch in chs:
+        seconds_ago = None
+        if ch.last_seen_at:
+            seconds_ago = int((now - ch.last_seen_at).total_seconds())
+        if ch.last_seen_at is None:
+            effective = "never_seen"
+        elif seconds_ago is not None and seconds_ago > STALE_HEARTBEAT_SECONDS:
+            effective = "stale"
+        else:
+            effective = ch.status or "unknown"
+        out.append({
+            "id": ch.id,
+            "display_name": ch.display_name,
+            "channel_type": ch.channel_type,
+            "status": ch.status,
+            "effective_status": effective,
+            "last_seen_at": serialize_dt(ch.last_seen_at),
+            "seconds_since_heartbeat": seconds_ago,
+            "last_error": ch.last_error,
+        })
+    return jsonify({"channel_accounts": out})
+
+
+# ---------- connector endpoints (X-Connector-Secret protected) ----------
 @app.route("/api/connectors/heartbeat", methods=["POST"])
+@require_connector_secret
 def connector_heartbeat():
     b = request.get_json(silent=True) or {}
     chid = b.get("channel_account_id")
     if not chid:
         return err("channel_account_id required")
-    hb = ConnectorHeartbeat(channel_account_id=chid,
-                            connector_id=b.get("connector_id"),
-                            connector_version=b.get("connector_version"),
-                            status=b.get("status", "healthy"),
-                            metadata_json=b.get("metadata") or {})
-    db.session.add(hb); db.session.commit()
+    ch = db.session.get(ChannelAccount, chid)
+    if not ch:
+        return err("channel account not found", 404)
+
+    sent_status = b.get("status") or "online"
+    metadata = b.get("metadata") or {}
+
+    ch.status = sent_status
+    ch.last_seen_at = datetime.utcnow()
+    ch.last_error = metadata.get("last_error")
+
+    hb = ConnectorHeartbeat(
+        channel_account_id=chid,
+        connector_id=b.get("connector_id"),
+        connector_version=b.get("connector_version"),
+        status=sent_status,
+        metadata_json=metadata,
+    )
+    db.session.add(hb)
+    db.session.commit()
     return jsonify({"received_at": serialize_dt(hb.last_heartbeat_at)})
 
 
 @app.route("/api/connectors/inbound", methods=["POST"])
+@require_connector_secret
 def ingest_inbound():
-    """Ingest one inbound message. Dedup by external_message_id. Auto-creates contact and conversation."""
     b = request.get_json(silent=True) or {}
     chid = b.get("channel_account_id")
     emid = b.get("external_message_id")
@@ -267,8 +389,10 @@ def ingest_inbound():
 
 
 @app.route("/api/outbound-queue/poll", methods=["POST"])
+@require_connector_secret
 def poll_outbound_queue():
-    """Connector atomically claims queued items; status flips to 'processing'."""
+    """Lazy cleanup: stuck-processing items (>5min) get reset before this poll."""
+    cleanup_stuck_queue_items()
     b = request.get_json(silent=True) or {}
     chid = b.get("channel_account_id")
     cnid = b.get("connector_id", "unknown")
@@ -294,8 +418,8 @@ def poll_outbound_queue():
 
 
 @app.route("/api/outbound-queue/<queue_id>", methods=["PATCH"])
+@require_connector_secret
 def update_queue_item(queue_id):
-    """Connector reports back: sent | failed | cancelled. On 'sent', a Message row is created."""
     item = db.session.get(OutboundMessageQueue, queue_id)
     if not item:
         return err("not found", 404)
@@ -340,6 +464,13 @@ def update_queue_item(queue_id):
     return jsonify({"id": item.id, "status": item.status, "attempts": item.attempts})
 
 
+# ---------- admin ----------
+@app.route("/api/admin/queue-cleanup", methods=["POST"])
+def admin_queue_cleanup():
+    return jsonify(cleanup_stuck_queue_items())
+
+
+# ---------- index + health ----------
 INDEX_HTML = ('<!doctype html><html><head><meta charset="utf-8">'
               '<title>Ohabai Pipeline</title>'
               '<style>body{font-family:-apple-system,sans-serif;max-width:880px;'
@@ -350,20 +481,20 @@ INDEX_HTML = ('<!doctype html><html><head><meta charset="utf-8">'
               'code{background:#eee;padding:2px 6px;border-radius:4px;font-size:13px}'
               'ul{padding-left:20px}li{margin:6px 0}</style></head><body>'
               '<h1>Ohabai Pipeline</h1>'
-              '<p class="sub">Phase 1 backend - unified omnichannel inbox CRM</p>'
-              '<div class="box"><p>Channel connectors plug in via the endpoints below. '
-              'No browser automation, no local bridges.</p></div>'
+              '<p class="sub">Backend - unified omnichannel inbox CRM</p>'
               '<h3>API</h3><ul>'
               '<li><code>GET /api/conversations</code> (X-Company-ID)</li>'
               '<li><code>GET /api/conversations/&lt;id&gt;/messages</code></li>'
               '<li><code>POST /api/conversations/&lt;id&gt;/send</code></li>'
+              '<li><code>GET /api/connector-status</code></li>'
               '<li><code>POST /api/contacts</code> &middot; '
               '<code>PATCH /api/contacts/&lt;id&gt;</code></li>'
               '<li><code>POST /api/channel-accounts</code></li>'
-              '<li><code>POST /api/connectors/heartbeat</code></li>'
-              '<li><code>POST /api/connectors/inbound</code></li>'
-              '<li><code>POST /api/outbound-queue/poll</code></li>'
-              '<li><code>PATCH /api/outbound-queue/&lt;id&gt;</code></li>'
+              '<li><code>POST /api/connectors/heartbeat</code> (secret)</li>'
+              '<li><code>POST /api/connectors/inbound</code> (secret)</li>'
+              '<li><code>POST /api/outbound-queue/poll</code> (secret)</li>'
+              '<li><code>PATCH /api/outbound-queue/&lt;id&gt;</code> (secret)</li>'
+              '<li><code>POST /api/admin/queue-cleanup</code></li>'
               '</ul><p><a href="/api/health">/api/health</a></p>'
               '</body></html>')
 
@@ -373,7 +504,7 @@ def index(): return render_template_string(INDEX_HTML)
 
 
 @app.route("/api/health")
-def health(): return jsonify({"status": "ok", "service": "ohabai-pipeline", "phase": 1})
+def health(): return jsonify({"status": "ok", "service": "ohabai-pipeline"})
 
 
 if __name__ == "__main__":

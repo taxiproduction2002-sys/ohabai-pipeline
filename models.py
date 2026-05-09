@@ -45,6 +45,8 @@ class ChannelAccount(db.Model):
     credentials = db.Column(db.JSON, default=dict)
     config = db.Column(db.JSON, default=dict)
     last_synced_at = db.Column(db.DateTime)
+    last_seen_at = db.Column(db.DateTime)
+    last_error = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
