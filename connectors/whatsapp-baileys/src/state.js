@@ -39,4 +39,6 @@ export const state = {
   connectionStatus: 'offline',
   lastError: null,
   threadCache: new ThreadCache(cacheFile),
+  reconnectAttempts: 0,
+  startedAt: Date.now(),
 };

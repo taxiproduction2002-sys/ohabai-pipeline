@@ -1,96 +1,153 @@
-# Ohabai Pipeline - WhatsApp (Baileys) connector
+# Ohabai WhatsApp Baileys Connector
 
-Headless Node.js connector that bridges one WhatsApp account into the
-Ohabai Pipeline backend. No browser, no Chromium, no whatsapp-web.js,
-no Mac UI. One process per WhatsApp account.
+Headless Node.js process that bridges one WhatsApp account to the
+Ohabai Pipeline backend. One process per WhatsApp account.
 
-## What this does
+## What it does
 
-- QR-login to WhatsApp Web. Multi-file auth persisted under
-  `./auth/<channel_account_id>/` so restarts skip the QR.
-- Streams inbound messages to `POST /api/connectors/inbound`. The backend
-  dedups on `external_message_id`, so re-delivery is safe.
-- Heartbeats every 15s to `POST /api/connectors/heartbeat` with status
-  `online | offline | reconnecting` and `last_error` (if any).
-- Polls `POST /api/outbound-queue/poll` every 3s (configurable), sends
-  each claimed item via Baileys, then PATCHes the queue item to
-  `sent` (with `external_message_id`) or `failed` (with `error_message`).
-- Caches `conversation_id -> chat JID` to
-  `./cache/<channel_account_id>/thread-cache.json` so outbound knows
-  where to send.
+- QR-links to WhatsApp Web via Baileys; multi-file auth persisted to disk
+- Inbound: every WA message -> POST /api/connectors/inbound (idempotent on external_message_id)
+- Outbound: poll /api/outbound-queue/poll every 3s, send via Baileys, PATCH back
+- Heartbeat every 15s
+- Reconnect: exponential backoff 2s -> 60s on connection drops
+- Health endpoint: HTTP /health on HEALTH_PORT (default 3000)
 
-## Phase 2 scope
+## Local development
 
-Text in, text out. Inbound captures metadata for image / video / audio /
-voice / file / sticker (mime, size, dimensions, duration), but media
-files are NOT downloaded yet. Outbound is text-only.
+### 1. Install
 
-## 1. Create the channel_account row
-
-Before running, create the row in the Pipeline backend so you have a
-`channel_account_id`:
-
-    curl -X POST http://localhost:5000/api/channel-accounts \
-      -H 'Content-Type: application/json' \
-      -H "X-Company-ID: $COMPANY_ID" \
-      -d '{
-        "channel_type": "whatsapp",
-        "connector_type": "whatsapp_baileys",
-        "display_name": "My WhatsApp",
-        "status": "pending"
-      }'
-
-The response gives you an `id` - that's your `CHANNEL_ACCOUNT_ID`.
-
-## 2. Configure
-
-    cd connectors/whatsapp-baileys
-    cp .env.example .env
-    # edit .env with PIPELINE_API_URL, COMPANY_ID, CHANNEL_ACCOUNT_ID
     npm install
 
-## 3. Run
+Requires Node.js 20+.
+
+### 2. Configure
+
+    cp .env.example .env
+
+Edit .env with local backend URL and the seed UUIDs:
+
+    PIPELINE_API_URL=http://localhost:5001
+    COMPANY_ID=<from local seed.py>
+    CHANNEL_ACCOUNT_ID=<from local seed.py>
+
+### 3. Run
 
     npm start
 
-On first run a QR appears in the terminal. Open WhatsApp on your phone:
-Settings -> Linked Devices -> Link a device -> scan. Auth is saved
-under `./auth/<channel_account_id>/` so subsequent restarts skip QR.
+Scan QR in WhatsApp -> Settings -> Linked Devices -> Link a device.
 
-## QR / login flow
+## Production deployment (VPS)
 
-- First run: no `./auth/<channel_account_id>/creds.json` -> Baileys
-  emits `qr` on `connection.update` -> printed in terminal.
-- After scan: connection state goes to `open`, status flips to `online`,
-  next heartbeat reflects this.
-- Logged out from phone: connector deletes `./auth/<channel_account_id>/`,
-  exits with code 1, requires manual restart and a new scan.
+Always-on Linux VPS via Docker Compose. Tested on Ubuntu 24.04 LTS.
+1 vCPU and 1 GB RAM is enough for one WhatsApp account.
 
-## Known limitations
+Reasonable providers: Hetzner CX11, DigitalOcean Basic Droplet,
+Vultr Cloud Compute. Any Ubuntu 22.04+ box with Docker support works.
 
-- One WhatsApp account per process. Multi-account is Phase 3.
-- No media upload or download yet. Inbound captures metadata only.
-- No typing indicators, read receipts, or presence are relayed.
-- Outbound thread JID resolution depends on either (a) the conversation
-  having seen at least one inbound message (cache hit) or (b) being
-  present in the first 200 conversations returned by
-  `GET /api/conversations` (fallback). Cold proactive outbound to a
-  brand-new number isn't supported until Phase 3.
-- Group chats: inbound works (sender = participant JID, thread = group
-  JID `<id>@g.us`). Outbound to groups works the same way as 1:1.
-- `status@broadcast` is ignored.
-- `fromMe` messages are skipped to avoid duplicating outbound that the
-  Pipeline queue already tracks.
+### 1. Provision the VPS
 
-## Logs
+Spin up Ubuntu 24.04 LTS. SSH in as root.
 
-- `info`: connection state, inbound, outbound, heartbeat lifecycle.
-- `warn`: poll failures, heartbeat failures, recoverable disconnects.
-- `error`: send failures, message handler errors.
-- Message text is truncated to 30-char previews. Full content is never
-  logged.
+### 2. Bootstrap
 
-## Files this creates
+After cloning the repo on the VPS:
 
-- `./auth/<channel_account_id>/` - Baileys session (gitignored, sensitive)
-- `./cache/<channel_account_id>/thread-cache.json` - conv -> JID map
+    sudo bash connectors/whatsapp-baileys/scripts/vps-setup.sh
+
+Installs Docker + Compose plugin, enables Docker on boot, creates an
+`ohabai` user in the docker group.
+
+### 3. Clone and configure
+
+    su - ohabai
+    git clone https://github.com/taxiproduction2002-sys/ohabai-pipeline.git
+    cd ohabai-pipeline/connectors/whatsapp-baileys
+    cp .env.production.example .env.production
+
+Edit .env.production with production UUIDs and a connector secret:
+
+    PIPELINE_API_URL=https://web-production-bc34a.up.railway.app
+    COMPANY_ID=9b6665fc-8c3a-451a-8bd5-c559ce9ceb00
+    CHANNEL_ACCOUNT_ID=657c2819-9b75-4da0-8d27-647757e02c65
+    CONNECTOR_SECRET=<any non-empty string>
+
+### 4. Start
+
+    docker compose up -d
+    docker compose logs -f
+
+On first run you'll see a QR. Scan from your phone - this re-links
+the WA account to the VPS, replacing whichever device was linked
+before. After "connection open", Ctrl+C to detach (container keeps
+running).
+
+### 5. Verify
+
+    curl -s http://<vps-ip>:3000/health
+
+Returns 200 with status "ok" when online; 503 degraded otherwise.
+
+### 6. Auto-recovery
+
+- Container exits -> Docker restarts (restart: unless-stopped).
+- Host reboots -> Docker daemon up -> container up.
+- WA connection drops -> exponential backoff reconnect (2s, 4s, ..., 60s max).
+
+### Migrating from a local connector
+
+The auth folder is not migrated automatically. Two options:
+
+**Clean re-link** (recommended): Stop the laptop connector. Deploy
+to VPS. Scan the new QR - WhatsApp transparently re-links to the new
+device, the laptop instance is disconnected.
+
+**Preserve session**: Stop the laptop connector. scp
+`auth/<channel_id>/` to
+`<vps>:/home/ohabai/ohabai-pipeline/connectors/whatsapp-baileys/data/auth/<channel_id>/`.
+Then `docker compose up -d` on the VPS. Only one device can hold the
+session at a time - copy once, then never run the laptop instance
+again or both will fight.
+
+## Operations
+
+### Logs
+
+    docker compose logs -f
+    docker compose logs --since 1h
+    docker compose logs | jq 'select(.level == "error")'
+
+JSON in production, pretty-printed in dev.
+
+### Restart / update / shutdown
+
+    docker compose restart           # restart in place
+    git pull && docker compose build && docker compose up -d   # update
+    docker compose down              # stop, keep volumes
+    docker compose down -v           # stop and DELETE volumes (nuke auth)
+
+### Health
+
+    curl http://<vps-ip>:3000/health
+
+### Volumes
+
+Bind-mounted from VPS host:
+
+    ./data/auth/<channel_account_id>/    # WA session creds + signal keys
+    ./data/cache/<channel_account_id>/   # thread JID cache
+
+To rotate credentials: delete the auth subdir and `docker compose
+restart` for a fresh QR.
+
+## Environment variables
+
+| Variable           | Required | Default | Notes                              |
+|--------------------|----------|---------|------------------------------------|
+| PIPELINE_API_URL   | yes      | -       | Backend base URL                   |
+| COMPANY_ID         | yes      | -       | Tenant UUID                        |
+| CHANNEL_ACCOUNT_ID | yes      | -       | Channel UUID; keys auth dir        |
+| CONNECTOR_SECRET   | no       | -       | Sent as X-Connector-Secret         |
+| POLL_INTERVAL_MS   | no       | 3000    | Outbound queue poll interval       |
+| LOG_LEVEL          | no       | info    | pino level                         |
+| HEALTH_PORT        | no       | 3000    | HTTP /health                       |
+| NODE_ENV           | no       | -       | "production" enables JSON logs     |

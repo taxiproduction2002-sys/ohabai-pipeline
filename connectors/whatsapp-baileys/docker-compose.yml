@@ -1,0 +1,25 @@
+services:
+  connector:
+    build: .
+    image: ohabai-whatsapp-baileys:latest
+    container_name: ohabai-wa-connector
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.production
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data/auth:/app/auth
+      - ./data/cache:/app/cache
+    healthcheck:
+      test: ["CMD", "node", "src/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

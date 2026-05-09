@@ -23,6 +23,12 @@ export function getSocket() {
   return sock;
 }
 
+function reconnectDelayMs(attempts) {
+  const base = 2000;
+  const max = 60000;
+  return Math.min(base * Math.pow(2, attempts - 1), max);
+}
+
 export async function startSocket(handlers) {
   const authDir = path.resolve(`./auth/${config.CHANNEL_ACCOUNT_ID}`);
   await fs.mkdir(authDir, { recursive: true });
@@ -61,34 +67,43 @@ export async function startSocket(handlers) {
 
     if (connection === 'open') {
       const me = sock.user?.id;
-      log.info({ me }, 'connection open');
+      log.info({ me, attempts: state.reconnectAttempts }, 'connection open');
       state.connectionStatus = 'online';
       state.lastError = null;
+      state.reconnectAttempts = 0;
     }
 
     if (connection === 'close') {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-      const errMsg = lastDisconnect?.error?.message || `disconnect statusCode=${statusCode}`;
+      const errMsg =
+        lastDisconnect?.error?.message ||
+        `disconnect statusCode=${statusCode}`;
 
       log.warn({ statusCode, isLoggedOut, err: errMsg }, 'connection closed');
       state.lastError = errMsg;
 
       if (isLoggedOut) {
         state.connectionStatus = 'offline';
-        log.error('logged out - clearing auth, restart required to scan a new QR');
+        log.error('logged out - clearing auth, restart required');
         try {
           await fs.rm(authDir, { recursive: true, force: true });
         } catch {}
         process.exit(1);
       } else {
         state.connectionStatus = 'reconnecting';
+        state.reconnectAttempts += 1;
+        const delay = reconnectDelayMs(state.reconnectAttempts);
+        log.warn(
+          { attempts: state.reconnectAttempts, delay_ms: delay },
+          'scheduling reconnect'
+        );
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
           startSocket(handlers).catch((e) =>
             log.error({ err: e.message }, 'reconnect failed')
           );
-        }, 2000);
+        }, delay);
       }
     }
   });
@@ -99,7 +114,10 @@ export async function startSocket(handlers) {
       try {
         await handlers.onMessage(msg, sock);
       } catch (e) {
-        log.error({ err: e.message, stack: e.stack }, 'message handler error');
+        log.error(
+          { err: e.message, stack: e.stack },
+          'message handler error'
+        );
       }
     }
   });
