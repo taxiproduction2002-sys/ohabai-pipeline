@@ -108,36 +108,92 @@ Then `docker compose up -d` on the VPS. Only one device can hold the
 session at a time - copy once, then never run the laptop instance
 again or both will fight.
 
-## Operations
+## Operational runbook (VPS)
 
-### Logs
+All commands below assume you're SSH'd in as the `ohabai` user, in
+`~/ohabai-pipeline/connectors/whatsapp-baileys/`.
 
+### Restart the connector
+
+    docker compose restart
+
+Container goes down, comes back, reconnects to WhatsApp using saved
+auth, resumes heartbeats and queue polling. No QR re-scan needed.
+
+### Check logs
+
+    docker compose logs -f                # tail live
+    docker compose logs --since 1h        # last hour
+    docker compose logs --tail 100        # last 100 lines
+    docker compose logs | jq 'select(.level == "error")'   # errors only
+
+JSON-formatted in production. Pretty-printed in dev.
+
+### Health check
+
+    curl http://localhost:3000/health
+
+200 ok = online. 503 degraded = reconnecting or offline. Run from
+the VPS host, or from outside via the VPS public IP and port 3000.
+
+### Re-scan QR (re-link WhatsApp)
+
+When to do this:
+- WA session was unlinked (someone scanned a new QR for the same
+  number, or you logged the device out from your phone)
+- Auth directory got corrupted
+- Connector logs say "logged out - clearing auth, restart required"
+- Moving the connector to a new server
+
+How:
+
+    docker compose down
+    rm -rf data/auth/<channel_account_id>/
+    docker compose up -d
     docker compose logs -f
-    docker compose logs --since 1h
-    docker compose logs | jq 'select(.level == "error")'
 
-JSON in production, pretty-printed in dev.
+Watch logs until QR appears. Scan from phone: WhatsApp -> Settings ->
+Linked Devices -> Link a device. After "connection open" appears,
+Ctrl+C to detach (container keeps running).
 
-### Restart / update / shutdown
+### Rotate the connector secret
 
-    docker compose restart           # restart in place
-    git pull && docker compose build && docker compose up -d   # update
-    docker compose down              # stop, keep volumes
-    docker compose down -v           # stop and DELETE volumes (nuke auth)
+1. Generate a new value:
 
-### Health
+       python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 
-    curl http://<vps-ip>:3000/health
+2. Update Railway: web service -> Variables -> edit CONNECTOR_SECRET
+   with new value. Railway redeploys ~1-2 min. During this window
+   the connector will 401-storm; expected.
 
-### Volumes
+3. On the VPS, update .env.production and restart:
 
-Bind-mounted from VPS host:
+       sed -i "s|^CONNECTOR_SECRET=.*|CONNECTOR_SECRET=<new value>|" .env.production
+       docker compose down
+       docker compose up -d
 
-    ./data/auth/<channel_account_id>/    # WA session creds + signal keys
-    ./data/cache/<channel_account_id>/   # thread JID cache
+Both sides match again, 401s stop within the next heartbeat tick.
 
-To rotate credentials: delete the auth subdir and `docker compose
-restart` for a fresh QR.
+### Update connector code
+
+After pushing new code to GitHub master:
+
+    cd ~/ohabai-pipeline
+    git pull
+    cd connectors/whatsapp-baileys
+    docker compose build
+    docker compose up -d
+
+Auth and cache volumes survive the rebuild; no QR re-scan needed.
+
+### Stop / nuke
+
+    docker compose stop                   # pause, keep volumes
+    docker compose start                  # resume
+    docker compose down                   # remove container, keep volumes
+    docker compose down -v                # remove + DELETE volumes (loses auth)
+
+Use `down -v` only if you intend to re-scan QR from scratch.
 
 ## Environment variables
 
