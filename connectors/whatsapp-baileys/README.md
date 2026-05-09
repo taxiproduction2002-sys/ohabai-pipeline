@@ -7,8 +7,8 @@ Ohabai Pipeline backend. One process per WhatsApp account.
 
 - QR-links to WhatsApp Web via Baileys; multi-file auth persisted to disk
 - Inbound: every WA message -> POST /api/connectors/inbound (idempotent on external_message_id)
-- Outbound: poll /api/outbound-queue/poll every 3s, send via Baileys, PATCH back
-- Heartbeat every 15s
+- Outbound: poll /api/outbound-queue/poll every POLL_INTERVAL_MS, send via Baileys, PATCH back
+- Heartbeat every HEARTBEAT_INTERVAL_MS; sends X-Connector-Secret on every request
 - Reconnect: exponential backoff 2s -> 60s on connection drops
 - Health endpoint: HTTP /health on HEALTH_PORT (default 3000)
 
@@ -24,11 +24,9 @@ Requires Node.js 20+.
 
     cp .env.example .env
 
-Edit .env with local backend URL and the seed UUIDs:
-
-    PIPELINE_API_URL=http://localhost:5001
-    COMPANY_ID=<from local seed.py>
-    CHANNEL_ACCOUNT_ID=<from local seed.py>
+Edit `.env` with local backend URL and seed UUIDs. Leave
+HEALTH_PORT=3100 for local dev so the connector's health endpoint
+doesn't collide with the frontend dev server on port 3000.
 
 ### 3. Run
 
@@ -44,54 +42,99 @@ Always-on Linux VPS via Docker Compose. Tested on Ubuntu 24.04 LTS.
 Reasonable providers: Hetzner CX11, DigitalOcean Basic Droplet,
 Vultr Cloud Compute. Any Ubuntu 22.04+ box with Docker support works.
 
-### 1. Provision the VPS
+### Final deployment checklist
 
-Spin up Ubuntu 24.04 LTS. SSH in as root.
+Each step is a yes/no check. Follow in order.
 
-### 2. Bootstrap
+#### Prerequisites
 
-After cloning the repo on the VPS:
+- VPS provisioned (1 vCPU, 1 GB RAM, Ubuntu 24.04 LTS)
+- SSH access as root
+- Production CONNECTOR_SECRET in hand (must match Railway env var)
+- Production COMPANY_ID and CHANNEL_ACCOUNT_ID in hand
 
-    sudo bash connectors/whatsapp-baileys/scripts/vps-setup.sh
+#### 1. Bootstrap the host
 
-Installs Docker + Compose plugin, enables Docker on boot, creates an
-`ohabai` user in the docker group.
+SSH in as root, then:
 
-### 3. Clone and configure
+    git clone https://github.com/taxiproduction2002-sys/ohabai-pipeline.git /opt/ohabai-pipeline
+    sudo bash /opt/ohabai-pipeline/connectors/whatsapp-baileys/scripts/vps-setup.sh
+
+Verify:
+
+    docker --version
+    docker compose version
+    id ohabai
+
+#### 2. Switch to the ohabai user
 
     su - ohabai
     git clone https://github.com/taxiproduction2002-sys/ohabai-pipeline.git
     cd ohabai-pipeline/connectors/whatsapp-baileys
+
+#### 3. Configure .env.production
+
     cp .env.production.example .env.production
+    nano .env.production
 
-Edit .env.production with production UUIDs and a connector secret:
+Required values:
 
+    NODE_ENV=production
     PIPELINE_API_URL=https://web-production-bc34a.up.railway.app
-    COMPANY_ID=9b6665fc-8c3a-451a-8bd5-c559ce9ceb00
-    CHANNEL_ACCOUNT_ID=657c2819-9b75-4da0-8d27-647757e02c65
-    CONNECTOR_SECRET=<any non-empty string>
+    COMPANY_ID=<your production COMPANY_ID>
+    CHANNEL_ACCOUNT_ID=<your production CHANNEL_ACCOUNT_ID>
+    CONNECTOR_SECRET=<must match Railway env exactly>
+    POLL_INTERVAL_MS=3000
+    HEARTBEAT_INTERVAL_MS=15000
+    HEALTH_PORT=3000
 
-### 4. Start
+#### 4. Bring up the container
 
     docker compose up -d
+    docker compose ps
+    docker compose logs --tail 50
+
+First time builds the image (~1-2 min).
+
+#### 5. Stop the laptop connector
+
+If the connector is still running on your laptop, Ctrl+C in that tab
+now. Only one device should hold the WA session.
+
+#### 6. Scan QR
+
     docker compose logs -f
 
-On first run you'll see a QR. Scan from your phone - this re-links
-the WA account to the VPS, replacing whichever device was linked
-before. After "connection open", Ctrl+C to detach (container keeps
-running).
+Wait for the QR. Scan from your phone: WhatsApp -> Settings ->
+Linked Devices -> Link a device. After "connection open", Ctrl+C
+to detach (container keeps running).
 
-### 5. Verify
+#### 7. Local health check
 
-    curl -s http://<vps-ip>:3000/health
+    curl http://localhost:3000/health
 
-Returns 200 with status "ok" when online; 503 degraded otherwise.
+Should return 200 with `"status":"ok"`.
 
-### 6. Auto-recovery
+#### 8. Verify backend is receiving heartbeats
 
-- Container exits -> Docker restarts (restart: unless-stopped).
-- Host reboots -> Docker daemon up -> container up.
-- WA connection drops -> exponential backoff reconnect (2s, 4s, ..., 60s max).
+From your laptop:
+
+    curl -s -H "X-Company-ID: <YOUR-COMPANY-ID>" \
+      https://web-production-bc34a.up.railway.app/api/connector-status \
+      | python3 -m json.tool
+
+`seconds_since_heartbeat` should be small. `effective_status: "online"`.
+
+#### 9. End-to-end test
+
+- Open the inbox, badge should be green
+- Send a WhatsApp message to your bridged number from another phone
+- Inbox should show it within ~3 seconds
+- Reply via the composer; phone receives within ~3 seconds
+- Close your laptop for 30 seconds
+- Send another inbound message
+- Reopen laptop, frontend should show the new message
+- Confirmed working without the laptop holding the connector
 
 ### Migrating from a local connector
 
@@ -104,79 +147,64 @@ device, the laptop instance is disconnected.
 **Preserve session**: Stop the laptop connector. scp
 `auth/<channel_id>/` to
 `<vps>:/home/ohabai/ohabai-pipeline/connectors/whatsapp-baileys/data/auth/<channel_id>/`.
-Then `docker compose up -d` on the VPS. Only one device can hold the
-session at a time - copy once, then never run the laptop instance
-again or both will fight.
+Then `docker compose up -d` on the VPS. No QR needed. Only one device
+can hold the session - copy once, then never run the laptop instance.
 
 ## Operational runbook (VPS)
 
-All commands below assume you're SSH'd in as the `ohabai` user, in
+All commands assume you're SSH'd in as the `ohabai` user, in
 `~/ohabai-pipeline/connectors/whatsapp-baileys/`.
 
 ### Restart the connector
 
     docker compose restart
 
-Container goes down, comes back, reconnects to WhatsApp using saved
-auth, resumes heartbeats and queue polling. No QR re-scan needed.
-
 ### Check logs
 
     docker compose logs -f                # tail live
-    docker compose logs --since 1h        # last hour
-    docker compose logs --tail 100        # last 100 lines
-    docker compose logs | jq 'select(.level == "error")'   # errors only
-
-JSON-formatted in production. Pretty-printed in dev.
+    docker compose logs --since 1h
+    docker compose logs --tail 100
+    docker compose logs | jq 'select(.level == "error")'
 
 ### Health check
 
     curl http://localhost:3000/health
 
-200 ok = online. 503 degraded = reconnecting or offline. Run from
-the VPS host, or from outside via the VPS public IP and port 3000.
+### Verify auth and cache volumes
 
-### Re-scan QR (re-link WhatsApp)
+    ls -la data/auth/<channel_account_id>/
+    ls -la data/cache/<channel_account_id>/
 
-When to do this:
-- WA session was unlinked (someone scanned a new QR for the same
-  number, or you logged the device out from your phone)
-- Auth directory got corrupted
-- Connector logs say "logged out - clearing auth, restart required"
-- Moving the connector to a new server
+`auth/` should contain `creds.json` and many `session-*.json` files
+once a QR has been scanned. `cache/` should contain `thread-cache.json`
+once messages have flowed. If either is empty after the connector has
+been running, the bind mount may be misconfigured - check
+`docker compose config` and ensure the `volumes:` block matches.
 
-How:
+### Re-scan QR
 
     docker compose down
     rm -rf data/auth/<channel_account_id>/
     docker compose up -d
     docker compose logs -f
 
-Watch logs until QR appears. Scan from phone: WhatsApp -> Settings ->
-Linked Devices -> Link a device. After "connection open" appears,
-Ctrl+C to detach (container keeps running).
-
 ### Rotate the connector secret
 
-1. Generate a new value:
+1. Generate:
 
        python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 
-2. Update Railway: web service -> Variables -> edit CONNECTOR_SECRET
-   with new value. Railway redeploys ~1-2 min. During this window
-   the connector will 401-storm; expected.
+2. Railway dashboard -> web service -> Variables -> edit
+   CONNECTOR_SECRET. Connector will 401-storm for ~1-2 min during
+   redeploy.
 
-3. On the VPS, update .env.production and restart:
+3. On VPS:
 
-       sed -i "s|^CONNECTOR_SECRET=.*|CONNECTOR_SECRET=<new value>|" .env.production
+       sed -i "s|^CONNECTOR_SECRET=.*|CONNECTOR_SECRET=<new>|" .env.production
        docker compose down
        docker compose up -d
 
-Both sides match again, 401s stop within the next heartbeat tick.
-
 ### Update connector code
-
-After pushing new code to GitHub master:
 
     cd ~/ohabai-pipeline
     git pull
@@ -184,7 +212,7 @@ After pushing new code to GitHub master:
     docker compose build
     docker compose up -d
 
-Auth and cache volumes survive the rebuild; no QR re-scan needed.
+Auth and cache survive the rebuild; no QR re-scan needed.
 
 ### Stop / nuke
 
@@ -193,17 +221,16 @@ Auth and cache volumes survive the rebuild; no QR re-scan needed.
     docker compose down                   # remove container, keep volumes
     docker compose down -v                # remove + DELETE volumes (loses auth)
 
-Use `down -v` only if you intend to re-scan QR from scratch.
-
 ## Environment variables
 
-| Variable           | Required | Default | Notes                              |
-|--------------------|----------|---------|------------------------------------|
-| PIPELINE_API_URL   | yes      | -       | Backend base URL                   |
-| COMPANY_ID         | yes      | -       | Tenant UUID                        |
-| CHANNEL_ACCOUNT_ID | yes      | -       | Channel UUID; keys auth dir        |
-| CONNECTOR_SECRET   | no       | -       | Sent as X-Connector-Secret         |
-| POLL_INTERVAL_MS   | no       | 3000    | Outbound queue poll interval       |
-| LOG_LEVEL          | no       | info    | pino level                         |
-| HEALTH_PORT        | no       | 3000    | HTTP /health                       |
-| NODE_ENV           | no       | -       | "production" enables JSON logs     |
+| Variable               | Required   | Default | Notes                                |
+|------------------------|------------|---------|--------------------------------------|
+| PIPELINE_API_URL       | yes        | -       | Backend base URL                     |
+| COMPANY_ID             | yes        | -       | Tenant UUID                          |
+| CHANNEL_ACCOUNT_ID     | yes        | -       | Channel UUID; keys auth dir          |
+| CONNECTOR_SECRET       | yes (prod) | -       | X-Connector-Secret; must match backend |
+| POLL_INTERVAL_MS       | no         | 3000    | Outbound queue poll interval         |
+| HEARTBEAT_INTERVAL_MS  | no         | 15000   | Heartbeat send interval              |
+| HEALTH_PORT            | no         | 3000    | /health port (use 3100 locally)      |
+| LOG_LEVEL              | no         | info    | pino level                           |
+| NODE_ENV               | no         | -       | "production" enables JSON logs       |

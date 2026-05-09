@@ -3,8 +3,6 @@ import { log } from './logger.js';
 import { api } from './api.js';
 import { state } from './state.js';
 
-const HEARTBEAT_INTERVAL_MS = 15000;
-
 async function sendHeartbeat() {
   try {
     await api.post('/api/connectors/heartbeat', {
@@ -26,6 +24,9 @@ async function sendHeartbeat() {
 
 export function startHeartbeat() {
   sendHeartbeat();
-  setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
-  log.info({ interval_ms: HEARTBEAT_INTERVAL_MS }, 'heartbeat started');
+  setInterval(sendHeartbeat, config.HEARTBEAT_INTERVAL_MS);
+  log.info(
+    { interval_ms: config.HEARTBEAT_INTERVAL_MS },
+    'heartbeat started'
+  );
 }

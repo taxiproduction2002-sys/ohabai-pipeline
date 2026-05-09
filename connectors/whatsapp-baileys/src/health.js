@@ -1,11 +1,9 @@
 import http from 'http';
-import { state } from './state.js';
 import { config } from './config.js';
+import { state } from './state.js';
 import { log } from './logger.js';
 
 export function startHealthServer() {
-  const port = parseInt(process.env.HEALTH_PORT || '3000', 10);
-
   const server = http.createServer((req, res) => {
     if (req.url === '/health') {
       const healthy = state.connectionStatus === 'online';
@@ -33,8 +31,8 @@ export function startHealthServer() {
     log.error({ err: err.message }, 'health server error');
   });
 
-  server.listen(port, () => {
-    log.info({ port }, 'health server listening');
+  server.listen(config.HEALTH_PORT, () => {
+    log.info({ port: config.HEALTH_PORT }, 'health server listening');
   });
 
   return server;
