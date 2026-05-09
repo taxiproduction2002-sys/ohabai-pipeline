@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
 from sqlalchemy import desc
 from models import (db, Company, User, ChannelAccount, Contact, Conversation,
                     ConversationParticipant, Message, MessageAttachment,
@@ -11,6 +12,7 @@ from models import (db, Company, User, ChannelAccount, Contact, Conversation,
                     OutboundMessageQueue, ConnectorHeartbeat)
 
 app = Flask(__name__)
+CORS(app, resources={r'/api/*': {'origins': '*'}})
 db_url = os.environ.get("DATABASE_URL", "postgresql://localhost/ohabai_pipeline")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
