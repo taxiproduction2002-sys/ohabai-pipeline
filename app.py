@@ -1,5 +1,7 @@
 """Ohabai Pipeline Phase 1 API. Connector-agnostic; connectors plug in via /api/connectors/* and /api/outbound-queue/*."""
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 from sqlalchemy import desc
