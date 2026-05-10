@@ -1,3 +1,4 @@
+import axios from 'axios';
 import { config } from './config.js';
 import { log } from './logger.js';
 import { api } from './api.js';
@@ -32,6 +33,48 @@ async function findThreadJid(conversationId) {
   }
 }
 
+// Phase 8G: download bytes from R2 (public URL, no auth headers).
+async function downloadBuffer(url) {
+  const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 60000 });
+  return Buffer.from(res.data);
+}
+
+// Phase 8G: build the right Baileys sendMessage shape per attachment_type.
+async function buildMediaMessage(att, caption) {
+  const url = att.file_url;
+  if (!url) throw new Error('attachment has no file_url');
+  const buf = await downloadBuffer(url);
+  const t = att.attachment_type || 'file';
+  const mime = att.mime_type;
+  if (t === 'image') {
+    const m = { image: buf, mimetype: mime || 'image/jpeg' };
+    if (caption) m.caption = caption;
+    return m;
+  }
+  if (t === 'video') {
+    const m = { video: buf, mimetype: mime || 'video/mp4' };
+    if (caption) m.caption = caption;
+    return m;
+  }
+  if (t === 'voice') {
+    return { audio: buf, ptt: true, mimetype: mime || 'audio/ogg; codecs=opus' };
+  }
+  if (t === 'audio') {
+    return { audio: buf, mimetype: mime || 'audio/mp4' };
+  }
+  if (t === 'sticker') {
+    return { sticker: buf };
+  }
+  // file / document
+  const m = {
+    document: buf,
+    mimetype: mime || 'application/octet-stream',
+    fileName: att.file_name || 'file',
+  };
+  if (caption) m.caption = caption;
+  return m;
+}
+
 async function sendItem(item) {
   const sock = getSocket();
   if (!sock) throw new Error('socket not connected');
@@ -40,19 +83,24 @@ async function sendItem(item) {
   }
 
   const payload = item.payload || {};
-  const text = payload.text;
-  const messageType = payload.message_type || 'text';
-
-  if (messageType !== 'text' || !text) {
-    throw new Error(`only text messages supported in Phase 2 (got type=${messageType})`);
-  }
+  const text = payload.text || '';
+  const attachments = payload.attachments || [];
 
   const jid = await findThreadJid(item.conversation_id);
   if (!jid) {
     throw new Error(`no thread JID resolved for conversation_id=${item.conversation_id}`);
   }
 
-  const result = await sock.sendMessage(jid, { text });
+  // Phase 8G: media-aware send. Use first attachment (multi-attach is Phase 8.5+).
+  let waMsg;
+  if (attachments.length > 0) {
+    waMsg = await buildMediaMessage(attachments[0], text);
+  } else {
+    if (!text) throw new Error('empty text and no attachments');
+    waMsg = { text };
+  }
+
+  const result = await sock.sendMessage(jid, waMsg);
   return { externalMessageId: result?.key?.id, jid };
 }
 
@@ -82,13 +130,19 @@ export async function pollOnce() {
         status: 'sent',
         external_message_id: externalMessageId,
       });
+      const atts = item.payload?.attachments || [];
       const txt = item.payload?.text || '';
+      const kind = atts.length > 0 ? (atts[0].attachment_type || 'file') : 'text';
+      const previewText = atts.length > 0
+        ? `[${kind}]${txt ? ' ' + txt.slice(0, 20) : ''}`
+        : (txt.length > 30 ? txt.slice(0, 30) + '...' : txt);
       log.info(
         {
           queue_id: item.id?.slice(-8),
           to: jid?.split('@')[0],
           msg_id: externalMessageId?.slice(-8),
-          preview: txt.length > 30 ? txt.slice(0, 30) + '...' : txt,
+          type: kind,
+          preview: previewText,
         },
         'outbound sent'
       );
