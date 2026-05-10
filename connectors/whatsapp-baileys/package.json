@@ -9,14 +9,17 @@
     "dev": "node --watch src/index.js",
     "healthcheck": "node src/healthcheck.js"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.18",
     "axios": "^1.7.9",
     "dotenv": "^16.4.7",
     "pino": "^9.6.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "@aws-sdk/client-s3": "^3.658.0"
   },
   "devDependencies": {
     "pino-pretty": "^13.0.0"

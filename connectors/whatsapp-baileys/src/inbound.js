@@ -1,7 +1,12 @@
+import { downloadMediaMessage } from '@whiskeysockets/baileys';
+import pino from 'pino';
 import { config } from './config.js';
 import { log } from './logger.js';
 import { api } from './api.js';
 import { state } from './state.js';
+import { uploadToR2, buildR2Key, inferExtension } from './r2.js';
+
+const downloadLog = pino({ level: 'silent' });
 
 function jidToPhone(jid) {
   if (!jid) return null;
@@ -82,6 +87,20 @@ function extractContent(msg) {
   return { text, messageType, attachment };
 }
 
+async function downloadAndUploadMedia(msg, attachment) {
+  const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger: downloadLog });
+  const mime = (attachment.mime_type || '').split(';')[0].trim();
+  const ext = inferExtension(mime, attachment.file_name);
+  const baseName = attachment.file_name
+    || `${attachment.attachment_type}-${(msg.key.id || 'media').slice(-12)}${ext}`;
+  const key = buildR2Key(config.COMPANY_ID, config.CHANNEL_ACCOUNT_ID, baseName);
+  const url = await uploadToR2(buf, key, mime || 'application/octet-stream');
+  attachment.file_url = url;
+  if (!attachment.file_size) attachment.file_size = buf.length;
+  if (!attachment.file_name) attachment.file_name = baseName;
+  return { size: buf.length, url };
+}
+
 export async function handleInbound(msg) {
   if (msg.key.remoteJid === 'status@broadcast') return;
   // Phase 2: skip own messages. Outbound is tracked via the queue, so
@@ -98,6 +117,22 @@ export async function handleInbound(msg) {
   const group = isGroup(chatJid);
   const senderJid = group ? msg.key.participant : msg.key.remoteJid;
   const senderPhone = jidToPhone(senderJid);
+
+  // Phase 8B: download media + upload to R2 (non-fatal — message still posts on failure)
+  if (content.attachment) {
+    try {
+      const r = await downloadAndUploadMedia(msg, content.attachment);
+      log.info(
+        { msg_id: msg.key.id?.slice(-8), type: content.attachment.attachment_type, size: r.size },
+        'media uploaded to R2'
+      );
+    } catch (e) {
+      log.error(
+        { err: e.message, msg_id: msg.key.id, type: content.attachment.attachment_type },
+        'media upload failed; posting without file_url'
+      );
+    }
+  }
 
   const payload = {
     channel_account_id: config.CHANNEL_ACCOUNT_ID,

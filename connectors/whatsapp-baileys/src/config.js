@@ -15,6 +15,10 @@ function intEnv(name, fallback) {
   return Number.isFinite(v) ? v : fallback;
 }
 
+function trimSlash(s) {
+  return (s || '').replace(/\/$/, '');
+}
+
 export const config = {
   PIPELINE_API_URL: required('PIPELINE_API_URL').replace(/\/$/, ''),
   COMPANY_ID: required('COMPANY_ID'),
@@ -25,4 +29,9 @@ export const config = {
   HEALTH_PORT: intEnv('HEALTH_PORT', 3000),
   CONNECTOR_ID: process.env.CONNECTOR_ID || `${os.hostname()}-${process.pid}`,
   CONNECTOR_VERSION: '1.1.0',
+  R2_BUCKET_NAME: process.env.R2_BUCKET_NAME || '',
+  R2_ENDPOINT_URL: trimSlash(process.env.R2_ENDPOINT_URL || ''),
+  R2_PUBLIC_URL: trimSlash(process.env.R2_PUBLIC_URL || ''),
+  R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID || '',
+  R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY || '',
 };
