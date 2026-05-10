@@ -507,6 +507,104 @@ def index(): return render_template_string(INDEX_HTML)
 def health(): return jsonify({"status": "ok", "service": "ohabai-pipeline"})
 
 
+# === PHASE 8A START ===
+# R2 attachment upload endpoint. Multipart in, returns {url, key, filename, mime_type, size_bytes}.
+
+import os as _os_8a
+import sys as _sys_8a
+import uuid as _uuid_8a
+from datetime import datetime as _dt_8a
+
+try:
+    import boto3 as _boto3_8a
+    from botocore.config import Config as _BotoConfig_8a
+except ImportError:
+    _boto3_8a = None
+    print("[8A] boto3 not available; /api/attachments/upload will fail until requirements installed", file=_sys_8a.stderr, flush=True)
+
+
+_R2_BUCKET     = _os_8a.environ.get("R2_BUCKET_NAME", "")
+_R2_ENDPOINT   = _os_8a.environ.get("R2_ENDPOINT_URL", "")
+_R2_ACCESS_KEY = _os_8a.environ.get("R2_ACCESS_KEY_ID", "")
+_R2_SECRET     = _os_8a.environ.get("R2_SECRET_ACCESS_KEY", "")
+_R2_PUBLIC_URL = _os_8a.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+
+
+def _r2_client_8a():
+    if _boto3_8a is None:
+        raise RuntimeError("boto3 not installed")
+    return _boto3_8a.client(
+        "s3",
+        endpoint_url=_R2_ENDPOINT,
+        aws_access_key_id=_R2_ACCESS_KEY,
+        aws_secret_access_key=_R2_SECRET,
+        region_name="auto",
+        config=_BotoConfig_8a(signature_version="s3v4"),
+    )
+
+
+def _r2_build_key_8a(company_id, channel_account_id, filename):
+    """<company_id>/<channel_account_id>/<yyyy>/<mm>/<dd>/<uuid>-<sanitized_filename>"""
+    today = _dt_8a.utcnow()
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in (filename or "file"))[:100]
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = "file"
+    return f"{company_id}/{channel_account_id or 'default'}/{today.year:04d}/{today.month:02d}/{today.day:02d}/{_uuid_8a.uuid4()}-{safe_name}"
+
+
+@app.route("/api/attachments/upload", methods=["POST"])
+def upload_attachment_8a():
+    """Multipart upload to R2.
+    Required form: file. Optional form: channel_account_id.
+    Header: X-Company-ID required.
+    Returns 201 {url, key, filename, mime_type, size_bytes}.
+    """
+    cid = get_company_id()
+    if not cid:
+        return err("X-Company-ID required")
+    if not (_R2_BUCKET and _R2_ENDPOINT and _R2_ACCESS_KEY and _R2_SECRET):
+        print("[r2] missing one or more R2_* env vars on Railway", file=_sys_8a.stderr, flush=True)
+        return err("R2 not configured", 500)
+    if "file" not in request.files:
+        return err("file part required (multipart form)")
+    f = request.files["file"]
+    if not f or not f.filename:
+        return err("empty file")
+    channel_account_id = request.form.get("channel_account_id", "")
+    body = f.read()
+    if not body:
+        return err("file is empty")
+    if len(body) > 25 * 1024 * 1024:
+        return err(f"file too large: {len(body)} bytes (max 25 MB)", 413)
+    mime_type = f.mimetype or "application/octet-stream"
+    key = _r2_build_key_8a(cid, channel_account_id, f.filename)
+    try:
+        _r2_client_8a().put_object(
+            Bucket=_R2_BUCKET,
+            Key=key,
+            Body=body,
+            ContentType=mime_type,
+            Metadata={
+                "company_id": str(cid),
+                "channel_account_id": str(channel_account_id),
+                "original_filename": (f.filename or "")[:200],
+            },
+        )
+    except Exception as e:
+        print(f"[r2] upload failed key={key}: {e}", file=_sys_8a.stderr, flush=True)
+        return err(f"R2 upload failed: {e}", 502)
+    public_url = f"{_R2_PUBLIC_URL}/{key}" if _R2_PUBLIC_URL else ""
+    print(f"[r2] uploaded key={key} size={len(body)} mime={mime_type}", file=_sys_8a.stderr, flush=True)
+    return jsonify({
+        "url": public_url,
+        "key": key,
+        "filename": f.filename,
+        "mime_type": mime_type,
+        "size_bytes": len(body),
+    }), 201
+# === PHASE 8A END ===
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
