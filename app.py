@@ -149,6 +149,12 @@ def get_messages(conv_id):
             q = q.filter(Message.created_at < bm.created_at)
     msgs = q.order_by(desc(Message.created_at)).limit(limit).all()
     msgs.reverse()
+    # Phase 9A: pre-fetch Contact display_names for group chat attribution
+    _sender_ids = {m.sender_contact_id for m in msgs if m.sender_contact_id}
+    _sender_names = {}
+    if _sender_ids:
+        for _c in Contact.query.filter(Contact.id.in_(_sender_ids)).all():
+            _sender_names[_c.id] = _c.display_name or ""
     out = []
     for m in msgs:
         atts = MessageAttachment.query.filter_by(message_id=m.id).all()
@@ -156,6 +162,7 @@ def get_messages(conv_id):
                     "text_content": m.text_content, "sender_type": m.sender_type,
                     "sender_contact_id": m.sender_contact_id, "sender_user_id": m.sender_user_id,
                     "sender_external_id": m.sender_external_id,
+                    "sender_name": _sender_names.get(m.sender_contact_id),
                     "external_message_id": m.external_message_id,
                     "quoted_message_id": m.quoted_message_id,
                     "platform_timestamp": serialize_dt(m.platform_timestamp),
