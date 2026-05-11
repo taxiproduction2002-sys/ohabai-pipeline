@@ -342,15 +342,36 @@ def ingest_inbound():
                               primary_phone=sxid if ch.channel_type == "whatsapp" else None,
                               external_handles={ch.channel_type: sxid})
             db.session.add(contact); db.session.flush()
+    # Phase 9F: group chat detection — synthetic "group Contact" carries the group subject
+    group_subject = b.get("group_subject")
+    is_group_chat = bool(etid and etid.endswith("@g.us"))
     conv = None
     if etid:
         conv = Conversation.query.filter_by(channel_account_id=chid,
                                             external_thread_id=etid).first()
     if not conv:
+        if is_group_chat:
+            group_contact = Contact(
+                company_id=ch.company_id,
+                display_name=group_subject or "WhatsApp Group",
+                primary_phone=None,
+                external_handles={"whatsapp_group": etid},
+            )
+            db.session.add(group_contact); db.session.flush()
+            _conv_contact_id = group_contact.id
+        else:
+            _conv_contact_id = contact.id if contact else None
         conv = Conversation(company_id=ch.company_id, channel_account_id=chid,
-                            contact_id=contact.id if contact else None,
+                            contact_id=_conv_contact_id,
                             external_thread_id=etid, status="open")
         db.session.add(conv); db.session.flush()
+    elif is_group_chat and group_subject and conv.contact_id:
+        # Refresh synthetic group Contact display_name if the WhatsApp group subject changed.
+        _gc = db.session.get(Contact, conv.contact_id)
+        if _gc and isinstance(_gc.external_handles, dict) and _gc.external_handles.get("whatsapp_group") == etid:
+            if _gc.display_name != group_subject:
+                _gc.display_name = group_subject
+                db.session.flush()
     pt = b.get("platform_timestamp"); platform_timestamp = None
     if pt is not None:
         try:

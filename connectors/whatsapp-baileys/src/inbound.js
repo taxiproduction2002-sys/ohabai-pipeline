@@ -5,8 +5,32 @@ import { log } from './logger.js';
 import { api } from './api.js';
 import { state } from './state.js';
 import { uploadToR2, buildR2Key, inferExtension } from './r2.js';
+import { getSocket } from './socket.js';
 
 const downloadLog = pino({ level: 'silent' });
+
+// Phase 9F: cache WhatsApp group subjects so we don't fetch metadata every message.
+const _groupSubjectCache = new Map();
+const _GROUP_SUBJECT_TTL_MS = 30 * 60 * 1000;
+
+async function getGroupSubject(jid) {
+  if (!jid || !jid.endsWith('@g.us')) return null;
+  const cached = _groupSubjectCache.get(jid);
+  if (cached && (Date.now() - cached.fetchedAt) < _GROUP_SUBJECT_TTL_MS) {
+    return cached.subject;
+  }
+  try {
+    const sock = getSocket();
+    if (!sock) return cached?.subject || null;
+    const meta = await sock.groupMetadata(jid);
+    const subj = meta?.subject || null;
+    _groupSubjectCache.set(jid, { subject: subj, fetchedAt: Date.now() });
+    return subj;
+  } catch (e) {
+    log.warn({ err: e.message, jid }, 'groupMetadata fetch failed');
+    return cached?.subject || null;
+  }
+}
 
 function jidToPhone(jid) {
   if (!jid) return null;
@@ -118,6 +142,12 @@ export async function handleInbound(msg) {
   const senderJid = group ? msg.key.participant : msg.key.remoteJid;
   const senderPhone = jidToPhone(senderJid);
 
+  // Phase 9F: fetch the WhatsApp group subject (cached) so backend can name the conv properly.
+  let groupSubject = null;
+  if (group) {
+    groupSubject = await getGroupSubject(chatJid);
+  }
+
   // Phase 8B: download media + upload to R2 (non-fatal — message still posts on failure)
   if (content.attachment) {
     try {
@@ -140,6 +170,7 @@ export async function handleInbound(msg) {
     external_thread_id: chatJid,
     sender_external_id: senderPhone,
     sender_name: msg.pushName || senderPhone,
+    group_subject: groupSubject,
     text: content.text,
     message_type: content.messageType,
     attachments: content.attachment ? [content.attachment] : [],
