@@ -320,6 +320,10 @@ def ingest_inbound():
     b = request.get_json(silent=True) or {}
     chid = b.get("channel_account_id")
     emid = b.get("external_message_id")
+    # Phase 10: accept direction so phone-sent fromMe messages can be ingested as outbound.
+    direction = b.get("direction", "inbound")
+    if direction not in ("inbound", "outbound"):
+        direction = "inbound"
     if not chid or not emid:
         return err("channel_account_id and external_message_id required")
     ch = db.session.get(ChannelAccount, chid)
