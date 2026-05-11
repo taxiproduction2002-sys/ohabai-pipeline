@@ -341,10 +341,12 @@ def ingest_inbound():
     if sxid:
         if ch.channel_type == "whatsapp":
             if is_lid:
-                contact = Contact.query.filter(
-                    Contact.company_id == ch.company_id,
-                    Contact.external_handles["whatsapp_lid"].astext == sxid,
+                # SQLAlchemy ".astext" requires JSONB; this column is plain JSON. Use raw Postgres ->> operator.
+                _lid_row = db.session.execute(
+                    text("SELECT id FROM contacts WHERE company_id = :cid AND external_handles->>'whatsapp_lid' = :lid LIMIT 1"),
+                    {"cid": str(ch.company_id), "lid": sxid},
                 ).first()
+                contact = db.session.get(Contact, _lid_row[0]) if _lid_row else None
             else:
                 contact = Contact.query.filter_by(company_id=ch.company_id,
                                                   primary_phone=sxid).first()
