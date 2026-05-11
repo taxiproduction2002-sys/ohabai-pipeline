@@ -127,9 +127,14 @@ async function downloadAndUploadMedia(msg, attachment) {
 
 export async function handleInbound(msg) {
   if (msg.key.remoteJid === 'status@broadcast') return;
-  // Phase 2: skip own messages. Outbound is tracked via the queue, so
-  // re-syncing fromMe inbound would create duplicates.
-  if (msg.key.fromMe) return;
+  // Phase 10: don't drop fromMe blindly. Echoes of our own /crm sends are
+  // tracked in sentTracker and skipped here. Anything else (phone-sent)
+  // falls through and is ingested as outbound below.
+  const fromMe = !!msg.key.fromMe;
+  if (fromMe && consumeSent(msg.key.id)) {
+    log.debug({ msg_id: msg.key.id }, 'fromMe echo for our own /crm send -- skipping');
+    return;
+  }
 
   const content = extractContent(msg);
   if (!content) {
@@ -139,8 +144,12 @@ export async function handleInbound(msg) {
 
   const chatJid = msg.key.remoteJid;
   const group = isGroup(chatJid);
-  const senderJid = group ? msg.key.participant : msg.key.remoteJid;
-  const senderPhone = jidToPhone(senderJid);
+  // Phase 10: for outbound (fromMe), the conv's other party is the chat itself
+  // for 1-on-1, and null for groups (synthetic group Contact carries the name).
+  const senderJid = fromMe
+    ? (group ? null : chatJid)
+    : (group ? msg.key.participant : msg.key.remoteJid);
+  const senderPhone = senderJid ? jidToPhone(senderJid) : null;
 
   // Phase 9F: fetch the WhatsApp group subject (cached) so backend can name the conv properly.
   let groupSubject = null;
@@ -169,7 +178,8 @@ export async function handleInbound(msg) {
     external_message_id: msg.key.id,
     external_thread_id: chatJid,
     sender_external_id: senderPhone,
-    sender_name: msg.pushName || senderPhone,
+    direction: fromMe ? 'outbound' : 'inbound',
+    sender_name: fromMe ? null : (msg.pushName || senderPhone),
     group_subject: groupSubject,
     text: content.text,
     message_type: content.messageType,

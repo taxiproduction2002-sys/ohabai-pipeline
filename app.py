@@ -390,10 +390,12 @@ def ingest_inbound():
                                      external_message_id=qext).first()
         if qm:
             qmid = qm.id
-    msg = Message(conversation_id=conv.id, direction="inbound",
+    # Phase 10: honor direction so phone-sent (fromMe) messages land as outbound.
+    msg = Message(conversation_id=conv.id, direction=direction,
                   message_type=b.get("message_type", "text"),
-                  text_content=b.get("text"), sender_type="contact",
-                  sender_contact_id=contact.id if contact else None,
+                  text_content=b.get("text"),
+                  sender_type=("user" if direction == "outbound" else "contact"),
+                  sender_contact_id=(None if direction == "outbound" else (contact.id if contact else None)),
                   sender_external_id=sxid, external_message_id=emid,
                   quoted_message_id=qmid, platform_timestamp=platform_timestamp,
                   raw_payload=b.get("raw_payload"))

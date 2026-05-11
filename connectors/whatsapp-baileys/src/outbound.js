@@ -4,6 +4,7 @@ import { log } from './logger.js';
 import { api } from './api.js';
 import { state } from './state.js';
 import { getSocket } from './socket.js';
+import { markSent } from './sentTracker.js';
 
 async function findThreadJid(conversationId) {
   if (state.threadCache.has(conversationId)) {
@@ -101,6 +102,7 @@ async function sendItem(item) {
   }
 
   const result = await sock.sendMessage(jid, waMsg);
+    if (result && result.key && result.key.id) markSent(result.key.id);
   return { externalMessageId: result?.key?.id, jid };
 }
 
