@@ -335,17 +335,37 @@ def ingest_inbound():
                         "deduped": True}), 200
     sxid = b.get("sender_external_id")
     etid = b.get("external_thread_id")
+    # Phase 10.1: @lid privacy-mode contacts have no real phone -- key off external_handles instead.
+    is_lid = bool(b.get("is_lid"))
     contact = None
     if sxid:
         if ch.channel_type == "whatsapp":
-            contact = Contact.query.filter_by(company_id=ch.company_id,
-                                              primary_phone=sxid).first()
+            if is_lid:
+                contact = Contact.query.filter(
+                    Contact.company_id == ch.company_id,
+                    Contact.external_handles["whatsapp_lid"].astext == sxid,
+                ).first()
+            else:
+                contact = Contact.query.filter_by(company_id=ch.company_id,
+                                                  primary_phone=sxid).first()
         if not contact:
-            contact = Contact(company_id=ch.company_id,
-                              display_name=b.get("sender_name") or sxid,
-                              primary_phone=sxid if ch.channel_type == "whatsapp" else None,
-                              external_handles={ch.channel_type: sxid})
+            if is_lid:
+                contact = Contact(company_id=ch.company_id,
+                                  display_name=b.get("sender_name") or "(unknown contact)",
+                                  primary_phone=None,
+                                  external_handles={"whatsapp_lid": sxid, ch.channel_type: sxid})
+            else:
+                contact = Contact(company_id=ch.company_id,
+                                  display_name=b.get("sender_name") or sxid,
+                                  primary_phone=sxid if ch.channel_type == "whatsapp" else None,
+                                  external_handles={ch.channel_type: sxid})
             db.session.add(contact); db.session.flush()
+        elif is_lid and direction == "inbound":
+            # Auto-replace placeholder display_name once the real pushName arrives on first inbound.
+            _new_name = b.get("sender_name")
+            if _new_name and contact.display_name in ("(unknown contact)", sxid):
+                contact.display_name = _new_name
+                db.session.flush()
     # Phase 9F: group chat detection — synthetic "group Contact" carries the group subject
     group_subject = b.get("group_subject")
     is_group_chat = bool(etid and etid.endswith("@g.us"))

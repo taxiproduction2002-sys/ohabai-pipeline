@@ -180,6 +180,7 @@ export async function handleInbound(msg) {
     external_thread_id: chatJid,
     sender_external_id: senderPhone,
     direction: fromMe ? 'outbound' : 'inbound',
+    is_lid: !!(senderJid && senderJid.endsWith('@lid')),
     sender_name: fromMe ? null : (msg.pushName || senderPhone),
     group_subject: groupSubject,
     text: content.text,
