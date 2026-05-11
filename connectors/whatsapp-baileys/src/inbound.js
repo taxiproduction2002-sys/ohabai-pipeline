@@ -6,6 +6,7 @@ import { api } from './api.js';
 import { state } from './state.js';
 import { uploadToR2, buildR2Key, inferExtension } from './r2.js';
 import { getSocket } from './socket.js';
+import { consumeSent } from './sentTracker.js';
 
 const downloadLog = pino({ level: 'silent' });
 
